@@ -57,7 +57,7 @@ export function resolveDesktopAutoUpdateTarget(
  * @param target - Supported release target.
  * @returns Filename stored beside electron-builder artifacts.
  */
-export function desktopBuildRecordFilename(target: DesktopAutoUpdateTarget): string
+export function desktopBuildRecordFilename(target: DesktopAutoUpdateTarget | 'linux-x64' | 'linux-arm64'): string
 
 /**
  * Return the electron-builder channel metadata filename for an application version.

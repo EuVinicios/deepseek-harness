@@ -35,6 +35,25 @@ export function localMacOSPackageEnvironment(environment = process.env) {
 }
 
 /**
+ * Select unsigned Linux local defaults; Linux packaging owns no signing credentials or dotenv file.
+ * The shipped production mandatory-update policy is retained so the shell matches the published
+ * installers, and each value stays overridable through the parent environment.
+ * @param {NodeJS.ProcessEnv} environment Parent environment, retained for build tools and networking.
+ * @returns {NodeJS.ProcessEnv} Unsigned build environment with the standard application identifier.
+ */
+export function localLinuxPackageEnvironment(environment = process.env) {
+  return {
+    ...Object.fromEntries(Object.entries(environment).filter(([name]) => !AMBIENT_RELEASE_SETTING.test(name))),
+    DSH_DESKTOP_APP_ID: 'com.deepseek.harness',
+    DSH_DESKTOP_UNSIGNED: '1',
+    ...(environment.DSH_DESKTOP_AUTO_UPDATE_ENV === undefined ? { DSH_DESKTOP_AUTO_UPDATE_ENV: 'production' } : {}),
+    ...(environment.DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN === undefined
+      && environment.DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN === undefined
+      ? { DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN: 'https://harness.deepseek.com' } : {}),
+  }
+}
+
+/**
  * Read a machine preset when selected, otherwise the target's required dotenv; no ambient release fallback.
  * PACKAGE_MACOS_ZIP_COMPRESSION_LEVEL overrides the Mac file setting with 3 or 7; an empty value is invalid.
  * Any defined Mac ZIP override rejects Windows, including an empty value; nonempty Windows overrides reject macOS.
@@ -47,6 +66,9 @@ export function localMacOSPackageEnvironment(environment = process.env) {
  * @returns {NodeJS.ProcessEnv} Isolated environment with file-owned release settings.
  */
 export function loadDesktopPackageEnvironment(platform, environment = process.env, appRoot = APP_ROOT, options = {}) {
+  if (platform === 'linux') {
+    throw new Error('desktop package: Linux packaging uses localLinuxPackageEnvironment; no platform dotenv exists')
+  }
   const compression = environment.PACKAGE_WINDOWS_COMPRESSION_LEVEL
   if (compression !== undefined && compression !== '') {
     if (platform !== 'win32' || !['3', '7'].includes(compression)) {
