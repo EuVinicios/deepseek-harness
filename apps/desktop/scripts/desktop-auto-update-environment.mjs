@@ -34,6 +34,8 @@ const UPDATE_ENVIRONMENTS = {
 }
 
 const UPDATE_TARGETS = new Set(['mac-arm64', 'mac-x64', 'win-x64'])
+/** Targets allowed to own a local packaging completion record; Linux builds write none yet. */
+const RECORD_TARGETS = new Set([...UPDATE_TARGETS, 'linux-x64', 'linux-arm64'])
 
 /**
  * Name the fixed installer object shared by uploading and cache refresh.
@@ -80,7 +82,7 @@ export function resolveDesktopAutoUpdateTarget(platform, arch) {
  * @returns {string} Filename stored beside electron-builder artifacts.
  */
 export function desktopBuildRecordFilename(target) {
-  if (!UPDATE_TARGETS.has(target)) {
+  if (!RECORD_TARGETS.has(target)) {
     throw new Error(`desktop auto-update: unsupported target ${target}`)
   }
   return `${target}-release.json`
