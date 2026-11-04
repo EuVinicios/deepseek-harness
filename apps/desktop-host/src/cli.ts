@@ -1,5 +1,6 @@
 /** Public dsh commands using the immutable runtime carried by the Desktop installation. */
 
+import { existsSync } from 'node:fs'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
 import { runCli } from '@deepseek-ai/dsh/lib/bin.js'
 
@@ -39,5 +40,12 @@ if (import.meta.main) {
     await installWindowsCliSignals()
   }
   const runtimeDir = resolve(import.meta.dirname, '../../../..')
-  await runDesktopCli(join(dirname(runtimeArchivePath(runtimeDir) ?? runtimeDir), 'runtime'))
+  // The support runtime sits beside its app container: the ASAR archive when the dsh tree is
+  // archived, the unpacked app directory when Linux ships the tree unpacked, and the dsh tree's
+  // own parent for prepared target directories, where dsh and runtime are siblings.
+  const archive = runtimeArchivePath(runtimeDir)
+  const supportRoot = archive !== undefined ? dirname(archive)
+    : existsSync(join(dirname(runtimeDir), 'runtime')) ? dirname(runtimeDir)
+    : join(dirname(runtimeDir), '..')
+  await runDesktopCli(join(supportRoot, 'runtime'))
 }

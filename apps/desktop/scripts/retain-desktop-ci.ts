@@ -51,6 +51,9 @@ export function resolveDesktopRetentionRunner(env: NodeJS.ProcessEnv): string {
  */
 export async function retainDesktopCi(env: NodeJS.ProcessEnv, appRoot = resolve(import.meta.dirname, '..')): Promise<string> {
   const target = resolveDesktopBuildTarget(env)
+  if (target !== 'mac-arm64' && target !== 'mac-x64' && target !== 'win-x64') {
+    throw new Error('desktop retention: CI retention covers mac and Windows targets only')
+  }
   const runnerLabel = resolveDesktopRetentionRunner(env)
   const windows = target === 'win-x64'
   const platform = windows ? 'win32' : 'darwin'

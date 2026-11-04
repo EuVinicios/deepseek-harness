@@ -107,7 +107,7 @@ function checkKoffi() {
 }
 
 /** Encode and decode a pixel through the packaged libvips binary. */
-async function checkSharp() {
+async function checkSharpInProcess() {
   const sharp = requireRuntime('sharp')
   const pixel = Buffer.from([17, 103, 231])
   const png = await sharp(pixel, { raw: { width: 1, height: 1, channels: 3 } }).png().toBuffer()
@@ -116,6 +116,38 @@ async function checkSharp() {
   assert.equal(decoded.info.height, 1)
   assert.equal(decoded.info.channels, 3)
   assert.deepEqual(decoded.data, pixel)
+}
+
+/**
+ * Exercise sharp the way the product runs it on this platform.
+ *
+ * Electron's Linux binaries link the globally-installed glib and leak its symbols into
+ * every process, so native workers such as sharp's crash inside the Electron Node runtime
+ * (electron#46323). The Linux product therefore runs sharp under the bundled primary
+ * runtime Node, and this check exercises that same runtime instead of this process.
+ * @param {string} resourcesRuntime - Packaged runtime directory outside ASAR.
+ */
+async function checkSharp(resourcesRuntime) {
+  if (process.platform !== 'linux') return checkSharpInProcess()
+  const node = join(resourcesRuntime, 'primary-runtime', 'dependencies', 'node', 'bin', 'node')
+  const script = join(scratch, 'sharp.cjs')
+  writeFileSync(script, `
+    const { createRequire } = require('node:module');
+    const assert = require('node:assert/strict');
+    const sharp = createRequire(${JSON.stringify(join(root, 'package.json'))})('sharp');
+    const pixel = Buffer.from([17, 103, 231]);
+    (async () => {
+      const png = await sharp(pixel, { raw: { width: 1, height: 1, channels: 3 } }).png().toBuffer();
+      const decoded = await sharp(png).raw().toBuffer({ resolveWithObject: true });
+      assert.equal(decoded.info.width, 1);
+      assert.equal(decoded.info.height, 1);
+      assert.equal(decoded.info.channels, 3);
+      assert.deepEqual(decoded.data, pixel);
+      console.log('runtime-payload-sharp-ok');
+    })().catch(error => { console.error(error); process.exit(1); });
+  `, { flag: 'wx', mode: 0o600 })
+  const output = execFileSync(node, [script], { cwd: root, encoding: 'utf8', timeout: 45_000, windowsHide: true })
+  assert.match(output, /runtime-payload-sharp-ok/u)
 }
 
 /** Exercise Domino parsing through the HTML converter and GFM plugin used by web_fetch. */
@@ -132,29 +164,41 @@ function checkHtml() {
   assert.match(markdown, /\| x\s+\| 7\s+\|/u)
 }
 
-try {
-  const builtin = requireRuntime('node-addon-require-builtin')
-  assert.equal(typeof builtin.requireBuiltin('internal/modules/esm/loader').getOrInitializeCascadedLoader, 'function')
-  console.error('runtime payload: pnpm')
-  await checkPnpm(resourcesRuntime)
-  console.error('runtime payload: koffi')
-  checkKoffi()
-  console.error('runtime payload: sharp')
-  await checkSharp()
-  console.error('runtime payload: html')
-  checkHtml()
-  console.error('runtime payload: pty')
-  await checkPty()
-  console.error('runtime payload: search')
-  await checkSearch()
-  console.error('runtime payload: checks complete; awaiting process exit')
-} finally {
-  // This private tree contains only fixture files; Windows may release handles after terminal exit.
-  await rm(scratch, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 })
-}
+// Electron's Linux runtime crashes (SIGSEGV inside native worker threads) when a
+// top-level await keeps the ESM module evaluation suspended across native addon
+// asynchronous work, so every check runs inside one plain async function and the
+// module evaluation never suspends.
+let payloadChecksPassed = false
+;(async () => {
+  try {
+    const builtin = requireRuntime('node-addon-require-builtin')
+    assert.equal(typeof builtin.requireBuiltin('internal/modules/esm/loader').getOrInitializeCascadedLoader, 'function')
+    console.error('runtime payload: pnpm')
+    await checkPnpm(resourcesRuntime)
+    console.error('runtime payload: koffi')
+    checkKoffi()
+    console.error('runtime payload: sharp')
+    await checkSharp(resourcesRuntime)
+    console.error('runtime payload: html')
+    checkHtml()
+    console.error('runtime payload: pty')
+    await checkPty()
+    console.error('runtime payload: search')
+    await checkSearch()
+    console.error('runtime payload: checks complete; awaiting process exit')
+    payloadChecksPassed = true
+  } catch (error) {
+    console.error(error)
+    process.exitCode = 1
+  } finally {
+    // This private tree contains only fixture files; Windows may release handles after terminal exit.
+    await rm(scratch, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 })
+  }
+})()
 
 // Natural event-loop drain includes node-pty's worker and console-list helper teardown.
 process.once('beforeExit', () => {
+  if (!payloadChecksPassed) return
   console.log(JSON.stringify({ node: process.versions.node, platform: process.platform, arch: process.arch,
     koffi: true, sharp: true, html: true, pty: true, pnpm: true, grep: true, glob: true }))
 })

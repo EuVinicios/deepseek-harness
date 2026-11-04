@@ -10,7 +10,7 @@ import {
 } from './desktop-auto-update-environment.mjs'
 import { desktopArtifactOutput, desktopTargetBuildPaths } from './desktop-build-paths.mjs'
 import { packageMacOSArtifacts, type DesktopPrepackagedArtifact } from './package-macos.ts'
-import { loadDesktopPackageEnvironment, localMacOSPackageEnvironment, validateDesktopPackageEnvironment } from './desktop-package-environment.mjs'
+import { loadDesktopPackageEnvironment, localLinuxPackageEnvironment, localMacOSPackageEnvironment, validateDesktopPackageEnvironment } from './desktop-package-environment.mjs'
 import { createPackagingRun, recordPackagingEvent } from './packaging-run.mjs'
 import { withWindowsSigningStage } from './windows-signing-stage.mjs'
 import { prepareWindowsSignatureCacheDirectory, resolveWindowsSignatureCacheDirectory } from './windows-signature-cache-directory.mjs'
@@ -48,14 +48,23 @@ const DESKTOP_UPLOAD_CREDENTIAL_ENV_NAMES = new Set([
 const AUTOMATIC_BUILD_VERSION = 'auto'
 
 /** Fixed platform and architecture identifiers exposed by package scripts. */
-export type DesktopPackageTargetName = 'mac-arm64' | 'mac-x64' | 'win-x64'
+export type DesktopPackageTargetName = 'mac-arm64' | 'mac-x64' | 'win-x64' | 'linux-x64' | 'linux-arm64'
+
+/** Targets the upstream update feed and fixed downloads serve; Linux packages have neither yet. */
+export type DesktopUpdateTargetName = 'mac-arm64' | 'mac-x64' | 'win-x64'
 
 /** One supported release target and its electron-builder selectors. */
-export interface DesktopPackageTarget {
-  readonly name: DesktopPackageTargetName
+export type DesktopPackageTarget = {
+  readonly name: DesktopUpdateTargetName
   readonly platform: 'darwin' | 'win32'
   readonly arch: 'arm64' | 'x64'
   readonly builderPlatform: '--mac' | '--win'
+  readonly builderArch: '--arm64' | '--x64'
+} | {
+  readonly name: 'linux-x64' | 'linux-arm64'
+  readonly platform: 'linux'
+  readonly arch: 'arm64' | 'x64'
+  readonly builderPlatform: '--linux'
   readonly builderArch: '--arm64' | '--x64'
 }
 
@@ -80,6 +89,20 @@ const TARGETS: Record<DesktopPackageTargetName, DesktopPackageTarget> = {
     arch: 'x64',
     builderPlatform: '--win',
     builderArch: '--x64',
+  },
+  'linux-x64': {
+    name: 'linux-x64',
+    platform: 'linux',
+    arch: 'x64',
+    builderPlatform: '--linux',
+    builderArch: '--x64',
+  },
+  'linux-arm64': {
+    name: 'linux-arm64',
+    platform: 'linux',
+    arch: 'arm64',
+    builderPlatform: '--linux',
+    builderArch: '--arm64',
   },
 }
 
@@ -180,6 +203,9 @@ export function resolveDesktopPackageTarget(
   const target = TARGETS[name]
   if (target.platform === 'win32' && (hostPlatform !== 'win32' || hostArch !== 'x64')) {
     throw new Error('desktop package: win-x64 requires a Windows x64 build host')
+  }
+  if (target.platform === 'linux' && (hostPlatform !== 'linux' || hostArch !== target.arch)) {
+    throw new Error(`desktop package: ${name} requires a Linux ${target.arch} build host`)
   }
   if (target.platform === 'darwin' && hostPlatform !== 'darwin') {
     throw new Error(`desktop package: ${name} requires a macOS build host`)
@@ -328,9 +354,13 @@ async function resolveRequestedBuildVersion(
   const requested = invocation.requestedBuildVersion
   if (requested === undefined) return productVersion
   if (requested !== AUTOMATIC_BUILD_VERSION) return validateDesktopBuildVersion(requested, productVersion)
-  const paths = desktopTargetBuildPaths(invocation.target.name, environment)
+  const { target } = invocation
+  if (target.platform === 'linux') {
+    throw new Error('desktop package: --build-version auto numbers the update bucket; Linux has no update bucket yet')
+  }
+  const paths = desktopTargetBuildPaths(target.name, environment)
   return suggestDesktopBuildVersion({
-    productVersion, target: invocation.target.name,
+    productVersion, target: target.name,
     // Machine presets own packaging, not upload credentials; local auto numbering uses existing artifacts.
     environment: environment.DSH_PACKAGING_PRESET === undefined ? environment : {},
     // Unsigned builds land beside the signed output, so numbering has to read the directory this run writes.
@@ -344,11 +374,13 @@ async function main(): Promise<void> {
   if (invocation.skipNotarization) {
     process.stdout.write('desktop package: skipping notarization and stapling; internal debugging only, not qualified for distribution or update publishing\n')
   }
-  const environment = target.platform === 'darwin' && invocation.unsigned
-    ? localMacOSPackageEnvironment()
-    : loadDesktopPackageEnvironment(target.platform, process.env, APP_ROOT, {
-      unsigned: invocation.unsigned, prepareOnly: invocation.prepareOnly,
-    })
+  const environment = target.platform === 'linux'
+    ? localLinuxPackageEnvironment(process.env)
+    : target.platform === 'darwin' && invocation.unsigned
+      ? localMacOSPackageEnvironment()
+      : loadDesktopPackageEnvironment(target.platform, process.env, APP_ROOT, {
+        unsigned: invocation.unsigned, prepareOnly: invocation.prepareOnly,
+      })
   const productVersion = packageVersion(join(APP_ROOT, 'package.json'), 'desktop package')
   // Release settings come from the selected configuration files, so the version this run publishes is an
   // argument; the environment variable below only carries it to the child processes that build.
@@ -387,7 +419,8 @@ async function main(): Promise<void> {
         ? packageTarget(invocation, environment, run)
         : withMacOSSigningKeychain(environment, signingEnvironment => packageTarget(invocation, signingEnvironment, run)), secrets)
     } else {
-      await packagingStep(run.directory, 'windows-package', () => packageTarget(invocation, environment, run), secrets)
+      await packagingStep(run.directory, target.platform === 'win32' ? 'windows-package' : 'linux-package',
+        () => packageTarget(invocation, environment, run), secrets)
     }
     success = true
   } catch (error) {
@@ -427,8 +460,11 @@ export async function packageTarget(
   const packConcurrency = mac?.packConcurrency ?? resolveWindowsPackageSettings(environment).packConcurrency
   const packArguments = ['--concurrency', String(packConcurrency)]
   const buildPaths = desktopTargetBuildPaths(target.name, environment)
-  const releaseRecordPath = join(buildPaths.artifacts, desktopBuildRecordFilename(target.name))
-  if (!invocation.prepareOnly && !invocation.unsigned && !invocation.skipNotarization) {
+  // The release record names one signed mac/win artifact set; unsigned and Linux builds write none.
+  const writesReleaseRecord = !invocation.prepareOnly && !invocation.unsigned && !invocation.skipNotarization
+    && target.platform !== 'linux'
+  const releaseRecordPath = writesReleaseRecord ? join(buildPaths.artifacts, desktopBuildRecordFilename(target.name)) : undefined
+  if (releaseRecordPath !== undefined) {
     rmSync(releaseRecordPath, { force: true })
     rmSync(`${releaseRecordPath}.tmp`, { force: true })
   }

@@ -122,7 +122,10 @@ export function createElectronBuilderConfig(
     // Unsigned builds carry their own suffix so a shared file can never pass for a release artifact.
     artifactName: `deepseek-harness-\${version}-\${os}-\${arch}${output.suffix}.\${ext}`,
     directories: { output: output.directory },
-    asar: true,
+    // Linux reads the dsh tree as a real directory: the Host runs the bundled primary-runtime
+    // Node (see runtimeResources), which cannot read an ASAR archive, and Electron's Linux
+    // glib interposition breaks native workers loaded from inside one (electron#46323).
+    asar: resolvedPlatform !== 'linux',
     electronDist: buildPaths.electron,
     electronFuses: { runAsNode: true },
     beforeBuild: async () => {
@@ -256,6 +259,11 @@ export function createElectronBuilderConfig(
     },
     linux: {
       category: 'Development',
+      // electron-builder derives the Linux executable from the npm package name, whose
+      // @deepseek-ai scope cannot name an executable path; name it like the other targets.
+      executableName: 'deepseek-harness',
+      syncDesktopName: true,
+      icon: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)),
       target: ['AppImage'],
     },
     nsis: {

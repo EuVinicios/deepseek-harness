@@ -207,7 +207,14 @@ interface RuntimeResources {
 
 function runtimeResources(): RuntimeResources {
   const development = !app.isPackaged
-  const node = process.execPath
+  // Electron's Linux binaries link the globally-installed glib and leak its symbols into
+  // every process (electron#46323), which crashes native workers such as sharp's inside
+  // Node-mode children. Linux runs the bundled primary-runtime Node instead, which is the
+  // same Node version and shares every internal module the Host requires.
+  const node = process.platform === 'linux'
+    ? join(development ? developmentPrimaryRuntime() : join(process.resourcesPath, 'runtime', 'primary-runtime'),
+      'dependencies', 'node', 'bin', 'node')
+    : process.execPath
   const nodeBin = development ? join(app.getAppPath(), 'scripts', 'node-bin') : join(process.resourcesPath, 'runtime', 'bin')
   const pnpm = (development ? process.env.DSH_DESKTOP_PNPM_ENTRY : undefined)
     ?? (development ? join(app.getAppPath(), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
@@ -1549,7 +1556,8 @@ async function main(): Promise<void> {
   if (typeof manifest !== 'object' || manifest === null) throw new Error('desktop policy: invalid application manifest')
   const developmentPolicy = app.isPackaged ? undefined : process.env.DSH_DESKTOP_MANDATORY_UPDATE_CONFIG
   const policyInput: unknown = app.isPackaged
-    ? ('dshMandatoryUpdatePolicy' in manifest ? manifest.dshMandatoryUpdatePolicy : undefined)
+    ? (process.platform === 'linux' ? undefined
+      : 'dshMandatoryUpdatePolicy' in manifest ? manifest.dshMandatoryUpdatePolicy : undefined)
     : developmentPolicy === undefined ? undefined : JSON.parse(developmentPolicy) as unknown
   const policyConfig = resolveDesktopPolicyConfig(policyInput, !app.isPackaged)
   if (policyConfig !== undefined) {
