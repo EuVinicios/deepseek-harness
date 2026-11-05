@@ -15,16 +15,16 @@ new file mode 100644
 index 0000000..7af1f5a
 --- /dev/null
 +++ b/dist/api/antigravity-acp.js
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,396 @@
 +/**
 + * Google Antigravity bridge (AI Pro subscription) over the Agent Client
-+ * Protocol. The agy_acp_server.par runtime speaks JSON-RPC on stdio, owns the
-+ * OAuth token file itself, and runs the full Gemini harness, so this adapter
-+ * spawns one server per stream, replays the transcript as a single prompt, and
-+ * maps ACP session updates onto the pi-ai event contract.
++ * Protocol. Mirroring the OpenBot ACP integration:
++ * - Persistent ACP daemon connection (no spawn/kill per turn).
++ * - Automatic tool permission approval (allow_always / allow_once).
++ * - Real multi-turn session persistence across conversation turns.
++ * - Real-time streaming of thinking and tool execution status.
 + */
 +import { spawn } from "node:child_process";
-+import { tmpdir } from "node:os";
 +import { calculateCost } from "../models.js";
 +import { formatProviderError, normalizeProviderError } from "../utils/error-body.js";
 +import { AssistantMessageEventStream } from "../utils/event-stream.js";
@@ -36,106 +36,6 @@ index 0000000..7af1f5a
 +}
 +function acpHarnessPath() {
 +    return process.env.ANTIGRAVITY_HARNESS_PATH || `${process.env.HOME}/opt/antigravity/bin/localharness_external`;
-+}
-+
-+/**
-+ * One ACP server lifecycle: spawn, initialize, authenticate, and open a
-+ * session, then hand the live handles to `run` and always kill the child.
-+ */
-+async function withAcpSession(run, systemPrompt) {
-+    const child = spawn(acpServerPath(), ["--uid="], {
-+        stdio: ["pipe", "pipe", "pipe"],
-+        env: {
-+            ...process.env,
-+            AGY_ACP_FORCE_FILE_STORAGE: "1",
-+            ANTIGRAVITY_HARNESS_PATH: acpHarnessPath(),
-+        },
-+    });
-+    const pending = new Map();
-+    const updates = [];
-+    let updateWake = null;
-+    let stderrTail = "";
-+    let exitError = undefined;
-+    child.on("error", (error) => { exitError = error; });
-+    child.on("exit", () => {
-+        exitError = exitError ?? new Error(`antigravity ACP server exited unexpectedly: ${stderrTail.slice(-400)}`);
-+        for (const { reject } of pending.values()) reject(exitError);
-+        pending.clear();
-+        notify();
-+    });
-+    const notify = () => { if (updateWake) { const w = updateWake; updateWake = null; w(); } };
-+    let buffer = "";
-+    child.stdout.on("data", (chunk) => {
-+        buffer += chunk.toString();
-+        let newlineIndex;
-+        while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-+            const line = buffer.slice(0, newlineIndex).trim();
-+            buffer = buffer.slice(newlineIndex + 1);
-+            if (!line) continue;
-+            let message;
-+            try { message = JSON.parse(line); } catch { continue; }
-+            if (message.id !== undefined && pending.has(message.id)) {
-+                const { resolve, reject } = pending.get(message.id);
-+                pending.delete(message.id);
-+                if (message.error) reject(new Error(`${message.error.message} (code ${message.error.code})`));
-+                else resolve(message.result);
-+            } else if (message.method === "session/update") {
-+                updates.push(message.params?.update ?? {});
-+                notify();
-+            } else if (message.method !== undefined && message.id !== undefined) {
-+                // A server -> client request. The bridge owns no tool executor,
-+                // so permission asks are answered with the first reject option
-+                // (or cancelled) and the turn continues without tool side effects.
-+                let result = {};
-+                if (message.method === "session/request_permission") {
-+                    const options = message.params?.options ?? [];
-+                    const reject = options.find((option) => /reject|deny|cancel|no/i.test(option.id ?? option.kind ?? option.name ?? ""));
-+                    result = reject
-+                        ? { outcome: { outcome: "selected", optionId: reject.id ?? reject.optionId } }
-+                        : { outcome: { outcome: "cancelled" } };
-+                }
-+                child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\n");
-+            }
-+        }
-+    });
-+    child.stderr.on("data", (chunk) => {
-+        stderrTail = (stderrTail + chunk.toString()).slice(-2000);
-+    });
-+    let nextId = 0;
-+    const request = (method, params) => new Promise((resolve, reject) => {
-+        if (exitError) { reject(exitError); return; }
-+        const id = ++nextId;
-+        pending.set(id, { resolve, reject });
-+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-+    });
-+    const nextUpdate = () => new Promise((resolve) => {
-+        if (updates.length > 0) { resolve(); return; }
-+        updateWake = resolve;
-+    });
-+    const runIo = {
-+        updates,
-+        nextUpdate,
-+        notify,
-+        request,
-+        stderr: () => stderrTail,
-+    };
-+    try {
-+        await request("initialize", { protocolVersion: 1, clientCapabilities: { fs: { read: true, write: true } } });
-+        await request("authenticate", { methodId: "oauth-personal" });
-+        const ptDirective = "Você é o assistente de IA do DeepSeek Harness no Linux. IMPORTANTE: Fale e responda SEMPRE em Português do Brasil (pt-BR) de forma prestativa, direta e atenciosa a todas as perguntas. Nunca responda em inglês.";
-+        const fullSystemPrompt = systemPrompt ? `${systemPrompt}\n\n${ptDirective}` : ptDirective;
-+        const session = await request("session/new", {
-+            cwd: process.cwd(),
-+            mcpServers: [],
-+            _meta: { antigravity: { systemPrompt: { append: fullSystemPrompt } } },
-+        });
-+        runIo.sessionId = session.sessionId;
-+        runIo.session = session;
-+        return await run(runIo);
-+    } finally {
-+        try { child.stdin.end(); } catch { /* child already gone */ }
-+        child.kill("SIGKILL");
-+    }
 +}
 +
 +/** Flatten one message's content into text the ACP transcript can carry. */
@@ -150,7 +50,7 @@ index 0000000..7af1f5a
 +    return parts.join("\n");
 +}
 +
-+/** Replay the transcript as one labelled prompt: the bridge holds no server history. */
++/** Replay the transcript as one labelled prompt for initial turns. */
 +function buildPrompt(messages) {
 +    const lines = [];
 +    for (const message of messages) {
@@ -161,6 +61,156 @@ index 0000000..7af1f5a
 +    }
 +    return [{ type: "text", text: lines.join("\n\n") }];
 +}
++
++/** For continued multi-turn sessions, send only the latest user message. */
++function lastUserPrompt(messages) {
++    for (let i = messages.length - 1; i >= 0; i--) {
++        if (messages[i].role === "user") {
++            const text = messageText(messages[i]).trim();
++            if (text) return [{ type: "text", text }];
++        }
++    }
++    return buildPrompt(messages);
++}
++
++function resolveWorkspaceCwd(systemPrompt) {
++    if (systemPrompt) {
++        const match = /(?:Working directory|Current directory|workspace):\s*([^\n\r]+)/i.exec(systemPrompt);
++        if (match && match[1]) {
++            const candidate = match[1].trim();
++            if (candidate.startsWith("/")) return candidate;
++        }
++    }
++    return process.env.PWD || process.cwd();
++}
++
++/**
++ * Singleton ACP Daemon manager keeping agy_acp_server.par alive.
++ */
++class AcpDaemon {
++    constructor() {
++        this.child = null;
++        this.pending = new Map();
++        this.nextId = 0;
++        this.sessionListeners = new Map();
++        this.initPromise = null;
++        this.isDead = false;
++        this.acpSessionMap = new Map(); // dshSessionId -> acpSessionId
++    }
++
++    start() {
++        if (this.child && !this.isDead) return;
++        this.isDead = false;
++        this.child = spawn(acpServerPath(), ["--uid="], {
++            stdio: ["pipe", "pipe", "pipe"],
++            env: {
++                ...process.env,
++                AGY_ACP_FORCE_FILE_STORAGE: "1",
++                ANTIGRAVITY_HARNESS_PATH: acpHarnessPath(),
++            },
++        });
++
++        let buffer = "";
++        this.child.stdout.on("data", (chunk) => {
++            buffer += chunk.toString();
++            let newlineIndex;
++            while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
++                const line = buffer.slice(0, newlineIndex).trim();
++                buffer = buffer.slice(newlineIndex + 1);
++                if (!line) continue;
++                let message;
++                try { message = JSON.parse(line); } catch { continue; }
++
++                if (message.id !== undefined && this.pending.has(message.id)) {
++                    const { resolve, reject } = this.pending.get(message.id);
++                    this.pending.delete(message.id);
++                    if (message.error) reject(new Error(`${message.error.message} (code ${message.error.code})`));
++                    else resolve(message.result);
++                } else if (message.method === "session/request_permission") {
++                    // OpenBot strategy: automatically approve tools with allow_always or allow_once
++                    const options = message.params?.options ?? [];
++                    const allow = options.find((opt) =>
++                        opt.kind === "allow_always" ||
++                        opt.kind === "allow_once" ||
++                        /allow|approve|always|once|yes/i.test(opt.kind ?? opt.id ?? opt.name ?? "")
++                    );
++                    const result = allow
++                        ? { outcome: { outcome: "selected", optionId: allow.id ?? allow.optionId } }
++                        : options[0]
++                            ? { outcome: { outcome: "selected", optionId: options[0].id ?? options[0].optionId } }
++                            : { outcome: { outcome: "cancelled" } };
++                    this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\n");
++                } else if (message.method === "session/update") {
++                    const update = message.params?.update ?? {};
++                    const sessionId = message.params?.sessionId || update?.sessionId;
++                    if (sessionId && this.sessionListeners.has(sessionId)) {
++                        this.sessionListeners.get(sessionId)(update);
++                    } else {
++                        for (const listener of this.sessionListeners.values()) {
++                            listener(update);
++                        }
++                    }
++                }
++            }
++        });
++
++        this.child.on("exit", () => {
++            this.isDead = true;
++            this.acpSessionMap.clear();
++            for (const { reject } of this.pending.values()) {
++                reject(new Error("Antigravity ACP server exited unexpectedly"));
++            }
++            this.pending.clear();
++        });
++
++        this.child.on("error", (err) => {
++            this.isDead = true;
++            this.acpSessionMap.clear();
++            for (const { reject } of this.pending.values()) {
++                reject(err);
++            }
++            this.pending.clear();
++        });
++    }
++
++    request(method, params) {
++        return new Promise((resolve, reject) => {
++            if (this.isDead || !this.child) {
++                return reject(new Error("Antigravity ACP server is not running"));
++            }
++            const id = ++this.nextId;
++            this.pending.set(id, { resolve, reject });
++            this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
++        });
++    }
++
++    async ensureInitialized() {
++        if (this.child && !this.isDead && !this.initPromise) return;
++        if (this.initPromise) return await this.initPromise;
++        this.initPromise = (async () => {
++            this.start();
++            await this.request("initialize", {
++                protocolVersion: 1,
++                clientCapabilities: { fs: { read: true, write: true }, terminal: { run: true } },
++            });
++            await this.request("authenticate", { methodId: "oauth-personal" });
++            this.initPromise = null;
++        })().catch((err) => {
++            this.initPromise = null;
++            this.isDead = true;
++            throw err;
++        });
++        return await this.initPromise;
++    }
++}
++
++const globalDaemon = new AcpDaemon();
++
++process.on("exit", () => {
++    if (globalDaemon.child && !globalDaemon.isDead) {
++        try { globalDaemon.child.kill("SIGTERM"); } catch { /* ignore */ }
++    }
++});
 +
 +const ACP_STOP_REASONS = {
 +    end_turn: "stop",
@@ -187,104 +237,170 @@ index 0000000..7af1f5a
 +            timestamp: Date.now(),
 +        };
 +        try {
++            await globalDaemon.ensureInitialized();
++            stream.push({ type: "start", partial: output });
++
 +            const systemMessage = getInitialSystemMessage(normalizedContext.messages);
 +            const systemPrompt = systemMessage ? messageText(systemMessage) : undefined;
-+            const prompt = buildPrompt(normalizedContext.messages);
-+            await withAcpSession(async (io) => {
-+                stream.push({ type: "start", partial: output });
-+                let currentBlock = null;
-+                const blocks = output.content;
-+                // The ACP model ids embed the thinking level and are exactly
-+                // the catalog ids this adapter serves, so the request carries
-+                // the model id verbatim.
-+                await io.request("session/set_model", { sessionId: io.sessionId, modelId: model.id });
-+                let response;
-+                let promptError = undefined;
-+                let settled = false;
-+                const settle = () => { settled = true; io.notify(); };
-+                const responsePromise = io.request("session/prompt", { sessionId: io.sessionId, prompt })
-+                    .then((value) => { response = value; settle(); })
-+                    .catch((error) => { promptError = error; settle(); });
-+                const drain = (async () => {
-+                    while (!settled) {
-+                        if (io.updates.length === 0) await io.nextUpdate();
-+                        if (settled) break;
-+                        while (io.updates.length > 0) {
-+                            const update = io.updates.shift();
-+                            const kind = update.sessionUpdate;
-+                            if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
-+                                const text = update.content?.text ?? "";
-+                                if (!text) continue;
-+                                const wantType = kind === "agent_message_chunk" ? "text" : "thinking";
-+                                if (!currentBlock || currentBlock.type !== wantType) {
-+                                    if (currentBlock) {
-+                                        stream.push({
-+                                            type: currentBlock.type === "text" ? "text_end" : "thinking_end",
-+                                            contentIndex: blocks.length - 1,
-+                                            content: currentBlock.type === "text" ? currentBlock.text : currentBlock.thinking,
-+                                            partial: output,
-+                                        });
-+                                    }
-+                                    currentBlock = wantType === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" };
-+                                    blocks.push(currentBlock);
-+                                    stream.push({ type: wantType === "text" ? "text_start" : "thinking_start", contentIndex: blocks.length - 1, partial: output });
-+                                }
-+                                if (wantType === "text") currentBlock.text += text;
-+                                else currentBlock.thinking += text;
-+                                stream.push({ type: wantType === "text" ? "text_delta" : "thinking_delta", contentIndex: blocks.length - 1, delta: text, partial: output });
-+                            }
-+                            // Other update kinds (usage ticks, permission asks)
-+                            // carry nothing the message stream can represent; a
-+                            // permission request resolves as denial by timeout
-+                            // of the prompt turn on the server side.
-+                        }
-+                    }
-+                })();
-+                await responsePromise;
-+                await drain;
-+                if (promptError) throw promptError;
-+                if (response?.stopReason) {
-+                    output.stopReason = ACP_STOP_REASONS[response.stopReason] ?? "stop";
-+                    if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
-+                        output.stopReason = "toolUse";
-+                    }
-+                } else {
-+                    output.stopReason = "stop";
++            const ptDirective = "Você é o assistente de IA do DeepSeek Harness no Linux. IMPORTANTE: Fale e responda SEMPRE em Português do Brasil (pt-BR) de forma prestativa, direta e atenciosa a todas as perguntas. Nunca responda em inglês.";
++            const fullSystemPrompt = systemPrompt ? `${systemPrompt}\n\n${ptDirective}` : ptDirective;
++            const cwd = resolveWorkspaceCwd(fullSystemPrompt);
++
++            const dshSessionKey = options?.sessionId ? String(options.sessionId) : null;
++            let acpSessionId = dshSessionKey ? globalDaemon.acpSessionMap.get(dshSessionKey) : null;
++            let isNewSession = false;
++
++            if (!acpSessionId) {
++                isNewSession = true;
++                const session = await globalDaemon.request("session/new", {
++                    cwd,
++                    mcpServers: [],
++                    _meta: { antigravity: { systemPrompt: { append: fullSystemPrompt } } },
++                });
++                acpSessionId = session.sessionId;
++                if (dshSessionKey) {
++                    globalDaemon.acpSessionMap.set(dshSessionKey, acpSessionId);
 +                }
-+                const usage = response?.usage;
-+                if (usage) {
-+                    output.usage = {
-+                        input: usage.inputTokens ?? 0,
-+                        output: usage.outputTokens ?? 0,
-+                        cacheRead: usage.cachedReadTokens ?? 0,
-+                        cacheWrite: usage.cachedWriteTokens ?? 0,
-+                        reasoning: usage.thoughtTokens ?? 0,
-+                        totalTokens: usage.totalTokens ?? 0,
-+                        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-+                    };
-+                    calculateCost(model, output.usage);
++            }
++
++            await globalDaemon.request("session/set_model", { sessionId: acpSessionId, modelId: model.id });
++
++            let prompt = isNewSession
++                ? buildPrompt(normalizedContext.messages)
++                : lastUserPrompt(normalizedContext.messages);
++
++            let currentBlock = null;
++            const blocks = output.content;
++
++            const onUpdate = (update) => {
++                const kind = update.sessionUpdate;
++                let text = "";
++                let wantType = "text";
++
++                if (kind === "agent_message_chunk") {
++                    text = update.content?.text ?? "";
++                    wantType = "text";
++                } else if (kind === "agent_thought_chunk") {
++                    text = update.content?.text ?? "";
++                    wantType = "thinking";
++                } else if (kind === "tool_call") {
++                    const title = update.title || update.name || update.kind || "ferramenta";
++                    text = `\n[Executando: ${title}]\n`;
++                    wantType = "thinking";
++                } else if (kind === "tool_call_update") {
++                    if (update.status === "completed") {
++                        text = `[Concluído]\n`;
++                        wantType = "thinking";
++                    } else if (update.status === "failed") {
++                        text = `[Falhou]\n`;
++                        wantType = "thinking";
++                    }
 +                }
-+                if (currentBlock) {
++
++                if (!text) return;
++
++                if (!currentBlock || currentBlock.type !== wantType) {
++                    if (currentBlock) {
++                        stream.push({
++                            type: currentBlock.type === "text" ? "text_end" : "thinking_end",
++                            contentIndex: blocks.length - 1,
++                            content: currentBlock.type === "text" ? currentBlock.text : currentBlock.thinking,
++                            partial: output,
++                        });
++                    }
++                    currentBlock = wantType === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" };
++                    blocks.push(currentBlock);
 +                    stream.push({
-+                        type: currentBlock.type === "text" ? "text_end" : "thinking_end",
++                        type: wantType === "text" ? "text_start" : "thinking_start",
 +                        contentIndex: blocks.length - 1,
-+                        content: currentBlock.type === "text" ? currentBlock.text : currentBlock.thinking,
 +                        partial: output,
 +                    });
 +                }
-+                if (options?.signal?.aborted) {
-+                    try { await io.request("session/cancel", { sessionId: io.sessionId }); } catch { /* server may be gone */ }
-+                    output.stopReason = "aborted";
-+                    output.errorMessage = "Request was aborted";
++
++                if (wantType === "text") currentBlock.text += text;
++                else currentBlock.thinking += text;
++
++                stream.push({
++                    type: wantType === "text" ? "text_delta" : "thinking_delta",
++                    contentIndex: blocks.length - 1,
++                    delta: text,
++                    partial: output,
++                });
++            };
++
++            globalDaemon.sessionListeners.set(acpSessionId, onUpdate);
++
++            let response;
++            try {
++                response = await globalDaemon.request("session/prompt", { sessionId: acpSessionId, prompt });
++            } catch (err) {
++                if (dshSessionKey && !isNewSession && /session/i.test(err.message)) {
++                    // Session was lost or invalidated; recreate and replay with full prompt
++                    globalDaemon.acpSessionMap.delete(dshSessionKey);
++                    const session = await globalDaemon.request("session/new", {
++                        cwd,
++                        mcpServers: [],
++                        _meta: { antigravity: { systemPrompt: { append: fullSystemPrompt } } },
++                    });
++                    acpSessionId = session.sessionId;
++                    globalDaemon.acpSessionMap.set(dshSessionKey, acpSessionId);
++                    globalDaemon.sessionListeners.set(acpSessionId, onUpdate);
++                    await globalDaemon.request("session/set_model", { sessionId: acpSessionId, modelId: model.id });
++                    prompt = buildPrompt(normalizedContext.messages);
++                    response = await globalDaemon.request("session/prompt", { sessionId: acpSessionId, prompt });
++                } else {
++                    throw err;
 +                }
-+                if (output.stopReason === "aborted" || output.stopReason === "error") {
-+                    stream.push({ type: "error", reason: output.stopReason, error: output });
-+                    stream.end();
-+                    return;
++            } finally {
++                globalDaemon.sessionListeners.delete(acpSessionId);
++            }
++
++            if (response?.stopReason) {
++                output.stopReason = ACP_STOP_REASONS[response.stopReason] ?? "stop";
++                if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
++                    output.stopReason = "toolUse";
 +                }
-+                stream.push({ type: "done", reason: output.stopReason, message: output });
++            } else {
++                output.stopReason = "stop";
++            }
++
++            const usage = response?.usage;
++            if (usage) {
++                output.usage = {
++                    input: usage.inputTokens ?? 0,
++                    output: usage.outputTokens ?? 0,
++                    cacheRead: usage.cachedReadTokens ?? 0,
++                    cacheWrite: usage.cachedWriteTokens ?? 0,
++                    reasoning: usage.thoughtTokens ?? 0,
++                    totalTokens: usage.totalTokens ?? 0,
++                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++                };
++                calculateCost(model, output.usage);
++            }
++
++            if (currentBlock) {
++                stream.push({
++                    type: currentBlock.type === "text" ? "text_end" : "thinking_end",
++                    contentIndex: blocks.length - 1,
++                    content: currentBlock.type === "text" ? currentBlock.text : currentBlock.thinking,
++                    partial: output,
++                });
++            }
++
++            if (options?.signal?.aborted) {
++                try { await globalDaemon.request("session/cancel", { sessionId: acpSessionId }); } catch { /* ignore */ }
++                output.stopReason = "aborted";
++                output.errorMessage = "Request was aborted";
++            }
++
++            if (output.stopReason === "aborted" || output.stopReason === "error") {
++                stream.push({ type: "error", reason: output.stopReason, error: output });
 +                stream.end();
-+            }, systemPrompt);
++                return;
++            }
++
++            stream.push({ type: "done", reason: output.stopReason, message: output });
++            stream.end();
 +        } catch (error) {
 +            output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 +            output.errorMessage = formatProviderError(normalizeProviderError(error));
@@ -294,8 +410,8 @@ index 0000000..7af1f5a
 +    })();
 +    return stream;
 +};
++
 +export const streamSimple = (model, context, options) => stream(model, context, options);
-+//# sourceMappingURL=antigravity-acp.js.map
 diff --git a/dist/api/bedrock-converse-stream.js b/dist/api/bedrock-converse-stream.js
 index 6ec62d0..abe5eee 100644
 --- a/dist/api/bedrock-converse-stream.js
