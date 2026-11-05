@@ -11,6 +11,7 @@ import { DesktopUpdatePreparationError, downloadFailureDetails } from './update-
 import type { DesktopUpdateChannel } from './update-channel.ts'
 import { selectUpdateChannel } from './updates/electron-updater/channel.ts'
 import { discardDesktopUpdate } from './updates/electron-updater/discard.ts'
+import { createLinuxUpdater, isLinuxUpdateSupported } from './updates/linux/linux-updater.ts'
 
 const { autoUpdater } = electronUpdater
 
@@ -60,8 +61,10 @@ export class DesktopUpdateCoordinator {
   constructor(
     private readonly publish: (state: DesktopUpdateState) => DesktopUpdateState,
     private readonly beforeRestart: () => Promise<boolean>,
-    private readonly updater: AppUpdater = autoUpdater,
-    private readonly enabled: () => boolean = () => app.isPackaged && existsSync(join(process.resourcesPath, 'app-update.yml')),
+    private readonly updater: AppUpdater = process.platform === 'linux' ? createLinuxUpdater() : autoUpdater,
+    private readonly enabled: () => boolean = () => process.platform === 'linux'
+      ? isLinuxUpdateSupported()
+      : (app.isPackaged && existsSync(join(process.resourcesPath, 'app-update.yml'))),
     private readonly currentVersion: () => string = () => app.getVersion(),
     private readonly downloadResult?: (success: boolean, reason?: string) => void,
     private channel: DesktopUpdateChannel = 'nightly',
