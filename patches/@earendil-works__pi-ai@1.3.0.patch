@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7af1f5a
 --- /dev/null
 +++ b/dist/api/antigravity-acp.js
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,280 @@
 +/**
 + * Google Antigravity bridge (AI Pro subscription) over the Agent Client
 + * Protocol. The agy_acp_server.par runtime speaks JSON-RPC on stdio, owns the
