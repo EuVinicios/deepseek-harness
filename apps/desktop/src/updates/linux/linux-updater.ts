@@ -116,7 +116,7 @@ export class LinuxAppUpdater extends EventEmitter {
       throw new Error('desktop update: linux updater script not found')
     }
 
-    const channelArg = this.channel === 'stable' ? 'stable' : 'nightly'
+    const channelArg = this.channel === 'latest' ? 'stable' : 'nightly'
     try {
       const { stdout } = await execFileAsync('bash', [script, '--check-json', '--channel', channelArg], {
         timeout: 15_000,
