@@ -10,6 +10,292 @@ index befb18b..7b7da85 100644
                              stream.push({
                                  type: "toolcall_delta",
                                  contentIndex: index,
+diff --git a/dist/api/antigravity-acp.js b/dist/api/antigravity-acp.js
+new file mode 100644
+index 0000000..7af1f5a
+--- /dev/null
++++ b/dist/api/antigravity-acp.js
+@@ -0,0 +1,279 @@
++/**
++ * Google Antigravity bridge (AI Pro subscription) over the Agent Client
++ * Protocol. The agy_acp_server.par runtime speaks JSON-RPC on stdio, owns the
++ * OAuth token file itself, and runs the full Gemini harness, so this adapter
++ * spawns one server per stream, replays the transcript as a single prompt, and
++ * maps ACP session updates onto the pi-ai event contract.
++ */
++import { spawn } from "node:child_process";
++import { tmpdir } from "node:os";
++import { calculateCost } from "../models.js";
++import { formatProviderError, normalizeProviderError } from "../utils/error-body.js";
++import { AssistantMessageEventStream } from "../utils/event-stream.js";
++import { collapseSystemMessages, getInitialSystemMessage } from "../utils/transcript.js";
++
++/** Resolve the ACP server binary; the bundled install lives under ~/opt. */
++function acpServerPath() {
++    return process.env.AGY_ACP_SERVER_PATH || `${process.env.HOME}/opt/antigravity/bin/agy_acp_server.par`;
++}
++function acpHarnessPath() {
++    return process.env.ANTIGRAVITY_HARNESS_PATH || `${process.env.HOME}/opt/antigravity/bin/localharness_external`;
++}
++
++/**
++ * One ACP server lifecycle: spawn, initialize, authenticate, and open a
++ * session, then hand the live handles to `run` and always kill the child.
++ */
++async function withAcpSession(run, systemPrompt) {
++    const child = spawn(acpServerPath(), ["--uid="], {
++        stdio: ["pipe", "pipe", "pipe"],
++        env: {
++            ...process.env,
++            AGY_ACP_FORCE_FILE_STORAGE: "1",
++            ANTIGRAVITY_HARNESS_PATH: acpHarnessPath(),
++        },
++    });
++    const pending = new Map();
++    const updates = [];
++    let updateWake = null;
++    let stderrTail = "";
++    let exitError = undefined;
++    child.on("error", (error) => { exitError = error; });
++    child.on("exit", () => {
++        exitError = exitError ?? new Error(`antigravity ACP server exited unexpectedly: ${stderrTail.slice(-400)}`);
++        for (const { reject } of pending.values()) reject(exitError);
++        pending.clear();
++        notify();
++    });
++    const notify = () => { if (updateWake) { const w = updateWake; updateWake = null; w(); } };
++    let buffer = "";
++    child.stdout.on("data", (chunk) => {
++        buffer += chunk.toString();
++        let newlineIndex;
++        while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
++            const line = buffer.slice(0, newlineIndex).trim();
++            buffer = buffer.slice(newlineIndex + 1);
++            if (!line) continue;
++            let message;
++            try { message = JSON.parse(line); } catch { continue; }
++            if (message.id !== undefined && pending.has(message.id)) {
++                const { resolve, reject } = pending.get(message.id);
++                pending.delete(message.id);
++                if (message.error) reject(new Error(`${message.error.message} (code ${message.error.code})`));
++                else resolve(message.result);
++            } else if (message.method === "session/update") {
++                updates.push(message.params?.update ?? {});
++                notify();
++            } else if (message.method !== undefined && message.id !== undefined) {
++                // A server -> client request. The bridge owns no tool executor,
++                // so permission asks are answered with the first reject option
++                // (or cancelled) and the turn continues without tool side effects.
++                let result = {};
++                if (message.method === "session/request_permission") {
++                    const options = message.params?.options ?? [];
++                    const reject = options.find((option) => /reject|deny|cancel|no/i.test(option.id ?? option.kind ?? option.name ?? ""));
++                    result = reject
++                        ? { outcome: { outcome: "selected", optionId: reject.id ?? reject.optionId } }
++                        : { outcome: { outcome: "cancelled" } };
++                }
++                child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\n");
++            }
++        }
++    });
++    child.stderr.on("data", (chunk) => {
++        stderrTail = (stderrTail + chunk.toString()).slice(-2000);
++    });
++    let nextId = 0;
++    const request = (method, params) => new Promise((resolve, reject) => {
++        if (exitError) { reject(exitError); return; }
++        const id = ++nextId;
++        pending.set(id, { resolve, reject });
++        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
++    });
++    const nextUpdate = () => new Promise((resolve) => {
++        if (updates.length > 0) { resolve(); return; }
++        updateWake = resolve;
++    });
++    const runIo = {
++        updates,
++        nextUpdate,
++        notify,
++        request,
++        stderr: () => stderrTail,
++    };
++    try {
++        await request("initialize", { protocolVersion: 1, clientCapabilities: { fs: { read: true, write: true } } });
++        await request("authenticate", { methodId: "oauth-personal" });
++        const ptDirective = "Você é o assistente de IA do DeepSeek Harness no Linux. IMPORTANTE: Fale e responda SEMPRE em Português do Brasil (pt-BR) de forma prestativa, direta e atenciosa a todas as perguntas. Nunca responda em inglês.";
++        const fullSystemPrompt = systemPrompt ? `${systemPrompt}\n\n${ptDirective}` : ptDirective;
++        const session = await request("session/new", {
++            cwd: process.cwd(),
++            mcpServers: [],
++            _meta: { antigravity: { systemPrompt: { append: fullSystemPrompt } } },
++        });
++        runIo.sessionId = session.sessionId;
++        runIo.session = session;
++        return await run(runIo);
++    } finally {
++        try { child.stdin.end(); } catch { /* child already gone */ }
++        child.kill("SIGKILL");
++    }
++}
++
++/** Flatten one message's content into text the ACP transcript can carry. */
++function messageText(message) {
++    const parts = [];
++    for (const block of message.content) {
++        if (block.type === "text") parts.push(block.text);
++        else if (block.type === "thinking") parts.push(`[thinking] ${block.thinking}`);
++        else if (block.type === "toolCall") parts.push(`[tool call ${block.name}] ${JSON.stringify(block.arguments)}`);
++        else if (block.type === "image") parts.push("[image attachment]");
++    }
++    return parts.join("\n");
++}
++
++/** Replay the transcript as one labelled prompt: the bridge holds no server history. */
++function buildPrompt(messages) {
++    const lines = [];
++    for (const message of messages) {
++        if (message.role === "system") continue;
++        const text = messageText(message).trim();
++        if (!text) continue;
++        lines.push(message.role === "assistant" ? `Assistente: ${text}` : `Usuário: ${text}`);
++    }
++    return [{ type: "text", text: lines.join("\n\n") }];
++}
++
++const ACP_STOP_REASONS = {
++    end_turn: "stop",
++    max_tokens: "length",
++    refusal: "error",
++    cancelled: "aborted",
++};
++
++export const stream = (model, context, options) => {
++    const stream = new AssistantMessageEventStream();
++    const normalizedContext = collapseSystemMessages(context);
++    (async () => {
++        const output = {
++            role: "assistant",
++            content: [],
++            api: "antigravity-acp",
++            provider: model.provider,
++            model: model.id,
++            usage: {
++                input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
++                totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++            },
++            stopReason: "pending",
++            timestamp: Date.now(),
++        };
++        try {
++            const systemMessage = getInitialSystemMessage(normalizedContext.messages);
++            const systemPrompt = systemMessage ? messageText(systemMessage) : undefined;
++            const prompt = buildPrompt(normalizedContext.messages);
++            await withAcpSession(async (io) => {
++                stream.push({ type: "start", partial: output });
++                let currentBlock = null;
++                const blocks = output.content;
++                // The ACP model ids embed the thinking level and are exactly
++                // the catalog ids this adapter serves, so the request carries
++                // the model id verbatim.
++                await io.request("session/set_model", { sessionId: io.sessionId, modelId: model.id });
++                let response;
++                let promptError = undefined;
++                let settled = false;
++                const settle = () => { settled = true; io.notify(); };
++                const responsePromise = io.request("session/prompt", { sessionId: io.sessionId, prompt })
++                    .then((value) => { response = value; settle(); })
++                    .catch((error) => { promptError = error; settle(); });
++                const drain = (async () => {
++                    while (!settled) {
++                        if (io.updates.length === 0) await io.nextUpdate();
++                        if (settled) break;
++                        while (io.updates.length > 0) {
++                            const update = io.updates.shift();
++                            const kind = update.sessionUpdate;
++                            if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
++                                const text = update.content?.text ?? "";
++                                if (!text) continue;
++                                const wantType = kind === "agent_message_chunk" ? "text" : "thinking";
++                                if (!currentBlock || currentBlock.type !== wantType) {
++                                    if (currentBlock) {
++                                        stream.push({
++                                            type: currentBlock.type === "text" ? "text_end" : "thinking_end",
++                                            contentIndex: blocks.length - 1,
++                                            content: currentBlock.type === "text" ? currentBlock.text : currentBlock.thinking,
++                                            partial: output,
++                                        });
++                                    }
++                                    currentBlock = wantType === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" };
++                                    blocks.push(currentBlock);
++                                    stream.push({ type: wantType === "text" ? "text_start" : "thinking_start", contentIndex: blocks.length - 1, partial: output });
++                                }
++                                if (wantType === "text") currentBlock.text += text;
++                                else currentBlock.thinking += text;
++                                stream.push({ type: wantType === "text" ? "text_delta" : "thinking_delta", contentIndex: blocks.length - 1, delta: text, partial: output });
++                            }
++                            // Other update kinds (usage ticks, permission asks)
++                            // carry nothing the message stream can represent; a
++                            // permission request resolves as denial by timeout
++                            // of the prompt turn on the server side.
++                        }
++                    }
++                })();
++                await responsePromise;
++                await drain;
++                if (promptError) throw promptError;
++                if (response?.stopReason) {
++                    output.stopReason = ACP_STOP_REASONS[response.stopReason] ?? "stop";
++                    if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
++                        output.stopReason = "toolUse";
++                    }
++                } else {
++                    output.stopReason = "stop";
++                }
++                const usage = response?.usage;
++                if (usage) {
++                    output.usage = {
++                        input: usage.inputTokens ?? 0,
++                        output: usage.outputTokens ?? 0,
++                        cacheRead: usage.cachedReadTokens ?? 0,
++                        cacheWrite: usage.cachedWriteTokens ?? 0,
++                        reasoning: usage.thoughtTokens ?? 0,
++                        totalTokens: usage.totalTokens ?? 0,
++                        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++                    };
++                    calculateCost(model, output.usage);
++                }
++                if (currentBlock) {
++                    stream.push({
++                        type: currentBlock.type === "text" ? "text_end" : "thinking_end",
++                        contentIndex: blocks.length - 1,
++                        content: currentBlock.type === "text" ? currentBlock.text : currentBlock.thinking,
++                        partial: output,
++                    });
++                }
++                if (options?.signal?.aborted) {
++                    try { await io.request("session/cancel", { sessionId: io.sessionId }); } catch { /* server may be gone */ }
++                    output.stopReason = "aborted";
++                    output.errorMessage = "Request was aborted";
++                }
++                if (output.stopReason === "aborted" || output.stopReason === "error") {
++                    stream.push({ type: "error", reason: output.stopReason, error: output });
++                    stream.end();
++                    return;
++                }
++                stream.push({ type: "done", reason: output.stopReason, message: output });
++                stream.end();
++            }, systemPrompt);
++        } catch (error) {
++            output.stopReason = options?.signal?.aborted ? "aborted" : "error";
++            output.errorMessage = formatProviderError(normalizeProviderError(error));
++            stream.push({ type: "error", reason: output.stopReason, error: output });
++            stream.end();
++        }
++    })();
++    return stream;
++};
++export const streamSimple = (model, context, options) => stream(model, context, options);
++//# sourceMappingURL=antigravity-acp.js.map
 diff --git a/dist/api/bedrock-converse-stream.js b/dist/api/bedrock-converse-stream.js
 index 6ec62d0..abe5eee 100644
 --- a/dist/api/bedrock-converse-stream.js
@@ -98,3 +384,121 @@ index 7da1c45..296d131 100644
                  break;
              }
              case "toolcall_end":
+diff --git a/dist/cli.js b/dist/cli.js
+old mode 100644
+new mode 100755
+diff --git a/dist/models.generated.js b/dist/models.generated.js
+index c41c8dc..21520b1 100644
+--- a/dist/models.generated.js
++++ b/dist/models.generated.js
+@@ -12,6 +12,7 @@ import { DEEPSEEK_CLASSIFIER_MODELS, DEEPSEEK_IMAGE_MODELS, DEEPSEEK_MODELS } fr
+ import { FIREWORKS_CLASSIFIER_MODELS, FIREWORKS_IMAGE_MODELS, FIREWORKS_MODELS } from "./providers/fireworks.models.js";
+ import { GITHUB_COPILOT_CLASSIFIER_MODELS, GITHUB_COPILOT_IMAGE_MODELS, GITHUB_COPILOT_MODELS } from "./providers/github-copilot.models.js";
+ import { GOOGLE_CLASSIFIER_MODELS, GOOGLE_IMAGE_MODELS, GOOGLE_MODELS } from "./providers/google.models.js";
++import { ANTIGRAVITY_MODELS } from "./providers/antigravity.models.js";
+ import { GOOGLE_VERTEX_CLASSIFIER_MODELS, GOOGLE_VERTEX_IMAGE_MODELS, GOOGLE_VERTEX_MODELS } from "./providers/google-vertex.models.js";
+ import { GROQ_CLASSIFIER_MODELS, GROQ_IMAGE_MODELS, GROQ_MODELS } from "./providers/groq.models.js";
+ import { HUGGINGFACE_CLASSIFIER_MODELS, HUGGINGFACE_IMAGE_MODELS, HUGGINGFACE_MODELS } from "./providers/huggingface.models.js";
+@@ -55,6 +56,7 @@ export const MODELS = {
+     "fireworks": FIREWORKS_MODELS,
+     "github-copilot": GITHUB_COPILOT_MODELS,
+     "google": GOOGLE_MODELS,
++    "antigravity": ANTIGRAVITY_MODELS,
+     "google-vertex": GOOGLE_VERTEX_MODELS,
+     "groq": GROQ_MODELS,
+     "huggingface": HUGGINGFACE_MODELS,
+diff --git a/dist/providers/all.js b/dist/providers/all.js
+index f9e3ac5..32e4e02 100644
+--- a/dist/providers/all.js
++++ b/dist/providers/all.js
+@@ -13,6 +13,7 @@ import { deepseekProvider } from "./deepseek.js";
+ import { fireworksProvider } from "./fireworks.js";
+ import { githubCopilotProvider } from "./github-copilot.js";
+ import { googleProvider } from "./google.js";
++import { antigravityProvider } from "./antigravity.js";
+ import { googleVertexProvider } from "./google-vertex.js";
+ import { groqProvider } from "./groq.js";
+ import { huggingfaceProvider } from "./huggingface.js";
+@@ -93,6 +94,7 @@ export function builtinProviders() {
+         deepseekProvider(),
+         fireworksProvider(),
+         githubCopilotProvider(),
++        antigravityProvider(),
+         googleProvider(),
+         googleVertexProvider(),
+         groqProvider(),
+diff --git a/dist/providers/antigravity.js b/dist/providers/antigravity.js
+new file mode 100644
+index 0000000..4fd3504
+--- /dev/null
++++ b/dist/providers/antigravity.js
+@@ -0,0 +1,42 @@
++/**
++ * Antigravity provider: Google AI Pro subscription models served through the
++ * local ACP runtime. Authentication is ambient — the runtime reads the token
++ * file the IDE/CLI login writes, so a stored credential is never required.
++ */
++import { existsSync, readFileSync } from "node:fs";
++import { homedir } from "node:os";
++import { join } from "node:path";
++import * as antigravityAcpApi from "../api/antigravity-acp.js";
++import { createProvider } from "../models.js";
++import { ANTIGRAVITY_MODELS } from "./antigravity.models.js";
++const TOKEN_FILENAME = "acp_token.json";
++function tokenPath() {
++    return join(process.env.GEMINI_HOME || join(homedir(), ".gemini"), "antigravity-acp", TOKEN_FILENAME);
++}
++function antigravityAuth() {
++    return {
++        name: "Antigravity (Google AI Pro)",
++        async resolve() {
++            const path = tokenPath();
++            if (!existsSync(path)) return undefined;
++            try {
++                const parsed = JSON.parse(readFileSync(path, "utf8"));
++                if (!parsed?.refresh_token) return undefined;
++                return { auth: { apiKey: "acp-managed" }, source: path };
++            } catch {
++                return undefined;
++            }
++        },
++    };
++}
++export function antigravityProvider() {
++    return createProvider({
++        id: "antigravity",
++        name: "Antigravity (Google AI Pro)",
++        baseUrl: "acp://local",
++        auth: { apiKey: antigravityAuth() },
++        models: Object.values(ANTIGRAVITY_MODELS),
++        api: antigravityAcpApi,
++    });
++}
++//# sourceMappingURL=antigravity.js.map
+diff --git a/dist/providers/antigravity.models.js b/dist/providers/antigravity.models.js
+new file mode 100644
+index 0000000..56acd82
+--- /dev/null
++++ b/dist/providers/antigravity.models.js
+@@ -0,0 +1,5 @@
++// This file is generated for the Antigravity subscription provider.
++import values from "./data/antigravity.json" with { type: "json" };
++import { flattenChatModelCatalog } from "../model-catalog.js";
++export const ANTIGRAVITY_MODELS = flattenChatModelCatalog("antigravity", values);
++//# sourceMappingURL=antigravity.models.js.map
+diff --git a/dist/providers/data/.manifest.json b/dist/providers/data/.manifest.json
+index a7fd658..03e9db4 100644
+--- a/dist/providers/data/.manifest.json
++++ b/dist/providers/data/.manifest.json
+@@ -1 +1 @@
+-{"schemaVersion":6,"generatedAt":"2026-10-15T19:00:55.287Z","structureHash":"f5b811296040611e9314534f2fb2464a007a47efe8b11b1e07dde80651a70bd4","files":{"amazon-bedrock.json":"df227d426b678e44cd82deae1cf433855d6b27f36fedcff3ef4fb812fe882868","ant-ling.json":"628feab3ef6c7d80ce96f75999804e1d9f05fec3851e5302e30fff3b69db90f6","anthropic.json":"91f5da01452c7746645d3405bc91e09f849e4e4687c7c7ff22d8976eafe64b87","azure.json":"46c4e25b84463c6475e706c581196d2735c35feb9612d2efca0ab932c917d727","baseten.json":"1fcdab8daf2881bd099eb08f9416f7df5bf39975937d2a63b841542bd032f2e6","cerebras.json":"3eccb58c5de3d0dc7ba49dc6e477ba29f00cb3150ce0a35cc90d59e6b5ab368e","cloudflare-ai-gateway.json":"388aefd2f1e5c5b0783673de1acda4a7ea8de853ebb5beeeede9646a90159a2a","cloudflare-workers-ai.json":"98b9c8cb412139ae3f5d2f5e49134f8412ed4e139a12bf6cb3aeba38aacc6bb3","deepseek.json":"10a296fb3e898f7715c80890c8af0af4f5fd58f22dbcd6612fdc5d762157ccdc","fireworks.json":"8db3c11f65a5d76260d5040a5dc5a9ef0f35b92de8505a30907c2355c2837b36","github-copilot.json":"1c7d77a4c320081bb0a80b2c8e185b34f07b73d38e67d20f3dcabcf72f2f8fcd","google-vertex.json":"564d692a4292ef12e98c8ec056a39948ea64e10851f5ddaaebcc37b585545231","google.json":"e13d3c51b13028d8253153165f7438ea2f3c3eaa8f209be952d3e9ded4494b5a","groq.json":"910952ad9dad07856983459d63fce0148dba1203edd7b10d801a77c5824f3405","huggingface.json":"6399e958790a9d90c21fb55d1cbef8569427a1ceb28de86dadeb3b4454ecfade","kimi-coding.json":"728d5ddb63ef52130552022d5ae2fd138fdc131ff854ac8c3b10ccaad355ab39","meta.json":"563f5ec07973f52ab8c3eb26ef91a36ad8a79e950b37174935666cdcb624bf35","minimax-cn.json":"1bbfbd11c3edbd141841d3cef027e12157218f1aec92477e15772116c1fabe7a","minimax.json":"a4b6864bd97eddf5749b2e117f643e751ec237408e8e24bec9e2f947782fa244","mistral.json":"27aa66c71a0504b53dc87ec194286fa7e70b99747fc8df9b709b23b3548afe50","moonshotai-cn.json":"79c9585dc84ee525ebaebbc78b3c55f3d369ec884d4f943488f1e0b14e3587f5","moonshotai.json":"1da2c4e34f22aef17a07c974d85bdee8e1b68b6dc712e3769c935b3f1e7dadca","nvidia.json":"98b47c4da26c8e649f48a874602fd7e9dc8a54ee0bdb40e3d07fe49189a842d2","openai-codex.json":"75dfc2f9e4b1e039978e069d94c983595ef8ff02eb64481901bedae5883b1d3f","openai.json":"3598d87bd39e40fe6ae44b07ecf3f9d27cb2e745e114c8b0c0fb0a3a84dd8d3e","opencode-go.json":"39408ee6da7302e3202d7f7b27d31d4d50a05c340bebd7da25ee23755d506475","opencode.json":"ecf8c62258249de738efee09932f1068c3feaf555779d0196aa129ea8339dd28","openrouter.json":"d303cf8e4ad2cfd322ea5fc8c9e617d46b21d36d9ebe0454be26ae92d91440aa","qwen-token-plan-cn.json":"2469a4091c474ec3db0a49a9962d8d2726c074ad9065b96bc4e0c87861c4c6c5","qwen-token-plan-individual.json":"0fb7cf64faf39d1a3b0a884210a86c87084b805eda15644f5f39293287b959dd","qwen-token-plan.json":"eff10620cb577142de4ec02698d5961a71fda2fe4f6ae7ea9432bad9d6844176","radius.json":"47c49f1ffaf2900c8e1e23ee61cb4cbe8c066ae59a4e2d01393c5c9772a1da04","together.json":"52293df62191c8e799ae3632f8ab1b3f52ee626aee0280677086627b32864bf7","typesafe.json":"a4429a2f696d5cc5273969af61a7310bda07d6bdcd27bf9ac9c76c534cc43716","vercel-ai-gateway.json":"154de982552dff9874764e724980aad167e2ff58be06d8477f2456494ef1e458","xai.json":"879c49b78b663a52a220ac4ee013e726b10c4f50aaa03bc58ee53a4b54c76928","xiaomi-token-plan-ams.json":"8266dc55ef720234373d4ff5434f0b8d40f614300d9e501f7d52935017534c82","xiaomi-token-plan-cn.json":"07ade989c0bd1ecf6ed9edc32e561c0dd28c317955b82f51e7a1875083906307","xiaomi-token-plan-sgp.json":"6afab55c8a37bc4018354ad657c774f0e664ae44cf79befb743bc5ae3fc3e9ba","xiaomi.json":"93f81b40e4d01f0193dd0b191f6ada2b851a71d351113067999ab0f9dc3f737e","zai-coding-cn.json":"ee5ee705fb6e413a6088db5e3616c27fce802a8ece6c355f1db35490d787f610","zai.json":"58e6642fdfb736f0b9a4a277c760c536a3cea66a030abbfb2615f7b2851d5c6f"}}
++{"schemaVersion":6,"generatedAt":"2026-11-05T11:52:20.000Z","structureHash":"5ff5f11136aa28e0f1b5536bb4286326757914229260547f6c6da060c0cd33f9","files":{"amazon-bedrock.json":"df227d426b678e44cd82deae1cf433855d6b27f36fedcff3ef4fb812fe882868","ant-ling.json":"628feab3ef6c7d80ce96f75999804e1d9f05fec3851e5302e30fff3b69db90f6","anthropic.json":"91f5da01452c7746645d3405bc91e09f849e4e4687c7c7ff22d8976eafe64b87","azure.json":"46c4e25b84463c6475e706c581196d2735c35feb9612d2efca0ab932c917d727","baseten.json":"1fcdab8daf2881bd099eb08f9416f7df5bf39975937d2a63b841542bd032f2e6","cerebras.json":"3eccb58c5de3d0dc7ba49dc6e477ba29f00cb3150ce0a35cc90d59e6b5ab368e","cloudflare-ai-gateway.json":"388aefd2f1e5c5b0783673de1acda4a7ea8de853ebb5beeeede9646a90159a2a","cloudflare-workers-ai.json":"98b9c8cb412139ae3f5d2f5e49134f8412ed4e139a12bf6cb3aeba38aacc6bb3","deepseek.json":"10a296fb3e898f7715c80890c8af0af4f5fd58f22dbcd6612fdc5d762157ccdc","fireworks.json":"8db3c11f65a5d76260d5040a5dc5a9ef0f35b92de8505a30907c2355c2837b36","github-copilot.json":"1c7d77a4c320081bb0a80b2c8e185b34f07b73d38e67d20f3dcabcf72f2f8fcd","google-vertex.json":"564d692a4292ef12e98c8ec056a39948ea64e10851f5ddaaebcc37b585545231","google.json":"e13d3c51b13028d8253153165f7438ea2f3c3eaa8f209be952d3e9ded4494b5a","groq.json":"910952ad9dad07856983459d63fce0148dba1203edd7b10d801a77c5824f3405","huggingface.json":"6399e958790a9d90c21fb55d1cbef8569427a1ceb28de86dadeb3b4454ecfade","kimi-coding.json":"728d5ddb63ef52130552022d5ae2fd138fdc131ff854ac8c3b10ccaad355ab39","meta.json":"563f5ec07973f52ab8c3eb26ef91a36ad8a79e950b37174935666cdcb624bf35","minimax-cn.json":"1bbfbd11c3edbd141841d3cef027e12157218f1aec92477e15772116c1fabe7a","minimax.json":"a4b6864bd97eddf5749b2e117f643e751ec237408e8e24bec9e2f947782fa244","mistral.json":"27aa66c71a0504b53dc87ec194286fa7e70b99747fc8df9b709b23b3548afe50","moonshotai-cn.json":"79c9585dc84ee525ebaebbc78b3c55f3d369ec884d4f943488f1e0b14e3587f5","moonshotai.json":"1da2c4e34f22aef17a07c974d85bdee8e1b68b6dc712e3769c935b3f1e7dadca","nvidia.json":"98b47c4da26c8e649f48a874602fd7e9dc8a54ee0bdb40e3d07fe49189a842d2","openai-codex.json":"75dfc2f9e4b1e039978e069d94c983595ef8ff02eb64481901bedae5883b1d3f","openai.json":"3598d87bd39e40fe6ae44b07ecf3f9d27cb2e745e114c8b0c0fb0a3a84dd8d3e","opencode-go.json":"39408ee6da7302e3202d7f7b27d31d4d50a05c340bebd7da25ee23755d506475","opencode.json":"ecf8c62258249de738efee09932f1068c3feaf555779d0196aa129ea8339dd28","openrouter.json":"d303cf8e4ad2cfd322ea5fc8c9e617d46b21d36d9ebe0454be26ae92d91440aa","qwen-token-plan-cn.json":"2469a4091c474ec3db0a49a9962d8d2726c074ad9065b96bc4e0c87861c4c6c5","qwen-token-plan-individual.json":"0fb7cf64faf39d1a3b0a884210a86c87084b805eda15644f5f39293287b959dd","qwen-token-plan.json":"eff10620cb577142de4ec02698d5961a71fda2fe4f6ae7ea9432bad9d6844176","radius.json":"47c49f1ffaf2900c8e1e23ee61cb4cbe8c066ae59a4e2d01393c5c9772a1da04","together.json":"52293df62191c8e799ae3632f8ab1b3f52ee626aee0280677086627b32864bf7","typesafe.json":"a4429a2f696d5cc5273969af61a7310bda07d6bdcd27bf9ac9c76c534cc43716","vercel-ai-gateway.json":"154de982552dff9874764e724980aad167e2ff58be06d8477f2456494ef1e458","xai.json":"879c49b78b663a52a220ac4ee013e726b10c4f50aaa03bc58ee53a4b54c76928","xiaomi-token-plan-ams.json":"8266dc55ef720234373d4ff5434f0b8d40f614300d9e501f7d52935017534c82","xiaomi-token-plan-cn.json":"07ade989c0bd1ecf6ed9edc32e561c0dd28c317955b82f51e7a1875083906307","xiaomi-token-plan-sgp.json":"6afab55c8a37bc4018354ad657c774f0e664ae44cf79befb743bc5ae3fc3e9ba","xiaomi.json":"93f81b40e4d01f0193dd0b191f6ada2b851a71d351113067999ab0f9dc3f737e","zai-coding-cn.json":"ee5ee705fb6e413a6088db5e3616c27fce802a8ece6c355f1db35490d787f610","zai.json":"58e6642fdfb736f0b9a4a277c760c536a3cea66a030abbfb2615f7b2851d5c6f","antigravity.json":"a27a8488cfcb309f31e7a68233707d8d9d432314d84b2c9de759d3ffee0c3d26"}}
+\ No newline at end of file
+diff --git a/dist/providers/data/antigravity.json b/dist/providers/data/antigravity.json
+new file mode 100644
+index 0000000..2e44318
+--- /dev/null
++++ b/dist/providers/data/antigravity.json
+@@ -0,0 +1 @@
++{"antigravity":{"gemini-4-argon-low":{"id":"gemini-4-argon-low","name":"Gemini 4 Argon (Low)","api":"antigravity-acp","provider":"antigravity","reasoning":true,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1048576,"maxTokens":65536,"type":"chat","baseUrl":"acp://local"},"gemini-4-argon-medium":{"id":"gemini-4-argon-medium","name":"Gemini 4 Argon (Medium)","api":"antigravity-acp","provider":"antigravity","reasoning":true,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1048576,"maxTokens":65536,"type":"chat","baseUrl":"acp://local"},"gemini-4-argon-high":{"id":"gemini-4-argon-high","name":"Gemini 4 Argon (High)","api":"antigravity-acp","provider":"antigravity","reasoning":true,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1048576,"maxTokens":65536,"type":"chat","baseUrl":"acp://local"},"gemini-3.8-flash-low":{"id":"gemini-3.8-flash-low","name":"Gemini 3.8 Flash (Low)","api":"antigravity-acp","provider":"antigravity","reasoning":true,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1048576,"maxTokens":65536,"type":"chat","baseUrl":"acp://local"},"gemini-3.8-flash-medium":{"id":"gemini-3.8-flash-medium","name":"Gemini 3.8 Flash (Medium)","api":"antigravity-acp","provider":"antigravity","reasoning":true,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1048576,"maxTokens":65536,"type":"chat","baseUrl":"acp://local"},"gemini-3.8-flash-high":{"id":"gemini-3.8-flash-high","name":"Gemini 3.8 Flash (High)","api":"antigravity-acp","provider":"antigravity","reasoning":true,"input":["text","image"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1048576,"maxTokens":65536,"type":"chat","baseUrl":"acp://local"}}}
+\ No newline at end of file

@@ -18,6 +18,7 @@ export const PROVIDER_DATA: Record<BuiltinProvider, ProviderData> & Partial<Reco
   'deepseek': { env: ['DEEPSEEK_API_KEY'], defaultBaseURL: 'https://api.deepseek.com' },
   'fireworks': { env: ['FIREWORKS_API_KEY'], defaultBaseURL: 'https://api.fireworks.ai/inference' },
   'github-copilot': { env: ['COPILOT_GITHUB_TOKEN'], defaultBaseURL: 'https://api.individual.githubcopilot.com' },
+  'antigravity': { env: [], defaultBaseURL: 'acp://local' },
   'google': { env: ['GEMINI_API_KEY'], defaultBaseURL: 'https://generativelanguage.googleapis.com/v1beta' },
   'google-vertex': { env: ['GOOGLE_CLOUD_API_KEY', 'GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_CLOUD_PROJECT', 'GCLOUD_PROJECT', 'GOOGLE_CLOUD_LOCATION'], baseURLEnv: ['GOOGLE_CLOUD_PROJECT', 'GCLOUD_PROJECT', 'GOOGLE_CLOUD_LOCATION'] },
   'groq': { env: ['GROQ_API_KEY'], defaultBaseURL: 'https://api.groq.com/openai/v1' },
