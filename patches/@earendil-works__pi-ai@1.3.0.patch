@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..7af1f5a
 --- /dev/null
 +++ b/dist/api/antigravity-acp.js
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,436 @@
 +/**
 + * Google Antigravity bridge (AI Pro subscription) over the Agent Client
 + * Protocol. Mirroring the OpenBot ACP integration:
@@ -280,6 +280,15 @@ index 0000000..7af1f5a
 +                if (dshSessionKey) {
 +                    globalDaemon.acpSessionMap.set(dshSessionKey, acpSessionId);
 +                }
++                try {
++                    await globalDaemon.request("session/set_config_option", {
++                        sessionId: acpSessionId,
++                        configId: "mode",
++                        value: "yolo",
++                    });
++                } catch {
++                    /* ignore mode config error */
++                }
 +            }
 +
 +            await globalDaemon.request("session/set_model", { sessionId: acpSessionId, modelId: model.id });
@@ -365,6 +374,15 @@ index 0000000..7af1f5a
 +                    acpSessionId = session.sessionId;
 +                    globalDaemon.acpSessionMap.set(dshSessionKey, acpSessionId);
 +                    globalDaemon.sessionListeners.set(acpSessionId, onUpdate);
++                    try {
++                        await globalDaemon.request("session/set_config_option", {
++                            sessionId: acpSessionId,
++                            configId: "mode",
++                            value: "yolo",
++                        });
++                    } catch {
++                        /* ignore */
++                    }
 +                    await globalDaemon.request("session/set_model", { sessionId: acpSessionId, modelId: model.id });
 +                    prompt = ensureNonEmptyPrompt(buildPrompt(normalizedContext.messages));
 +                    response = await globalDaemon.request("session/prompt", { sessionId: acpSessionId, prompt });
@@ -395,7 +413,9 @@ index 0000000..7af1f5a
 +                    totalTokens: usage.totalTokens ?? 0,
 +                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 +                };
-+                calculateCost(model, output.usage);
++                if (model?.cost) {
++                    try { calculateCost(model, output.usage); } catch { /* ignore cost calculation */ }
++                }
 +            }
 +
 +            if (currentBlock) {
