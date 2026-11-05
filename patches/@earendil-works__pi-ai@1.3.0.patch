@@ -15,13 +15,14 @@ new file mode 100644
 index 0000000..7af1f5a
 --- /dev/null
 +++ b/dist/api/antigravity-acp.js
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,416 @@
 +/**
 + * Google Antigravity bridge (AI Pro subscription) over the Agent Client
 + * Protocol. Mirroring the OpenBot ACP integration:
 + * - Persistent ACP daemon connection (no spawn/kill per turn).
 + * - Automatic tool permission approval (allow_always / allow_once).
 + * - Real multi-turn session persistence across conversation turns.
++ * - Robust message content extraction (supporting string and block arrays).
 + * - Real-time streaming of thinking and tool execution status.
 + */
 +import { spawn } from "node:child_process";
@@ -40,12 +41,19 @@ index 0000000..7af1f5a
 +
 +/** Flatten one message's content into text the ACP transcript can carry. */
 +function messageText(message) {
++    if (!message) return "";
++    if (typeof message === "string") return message;
++    if (typeof message.content === "string") return message.content;
 +    const parts = [];
-+    for (const block of message.content) {
-+        if (block.type === "text") parts.push(block.text);
-+        else if (block.type === "thinking") parts.push(`[thinking] ${block.thinking}`);
-+        else if (block.type === "toolCall") parts.push(`[tool call ${block.name}] ${JSON.stringify(block.arguments)}`);
-+        else if (block.type === "image") parts.push("[image attachment]");
++    if (Array.isArray(message.content)) {
++        for (const block of message.content) {
++            if (!block) continue;
++            if (typeof block === "string") parts.push(block);
++            else if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
++            else if (block.type === "thinking" && typeof block.thinking === "string") parts.push(`[thinking] ${block.thinking}`);
++            else if (block.type === "toolCall") parts.push(`[tool call ${block.name || "tool"}] ${JSON.stringify(block.arguments || {})}`);
++            else if (block.type === "image") parts.push("[image attachment]");
++        }
 +    }
 +    return parts.join("\n");
 +}
@@ -59,7 +67,8 @@ index 0000000..7af1f5a
 +        if (!text) continue;
 +        lines.push(message.role === "assistant" ? `Assistente: ${text}` : `Usuário: ${text}`);
 +    }
-+    return [{ type: "text", text: lines.join("\n\n") }];
++    const fullText = lines.join("\n\n").trim();
++    return [{ type: "text", text: fullText || "Olá" }];
 +}
 +
 +/** For continued multi-turn sessions, send only the latest user message. */
@@ -73,11 +82,19 @@ index 0000000..7af1f5a
 +    return buildPrompt(messages);
 +}
 +
++function ensureNonEmptyPrompt(promptList, fallback = "Olá") {
++    if (!Array.isArray(promptList) || promptList.length === 0) {
++        return [{ type: "text", text: fallback }];
++    }
++    const valid = promptList.filter((p) => p && p.type === "text" && p.text && p.text.trim().length > 0);
++    return valid.length > 0 ? valid : [{ type: "text", text: fallback }];
++}
++
 +function resolveWorkspaceCwd(systemPrompt) {
 +    if (systemPrompt) {
 +        const match = /(?:Working directory|Current directory|workspace):\s*([^\n\r]+)/i.exec(systemPrompt);
 +        if (match && match[1]) {
-+            const candidate = match[1].trim();
++            const candidate = match[1].trim().replace(/^["']|["']$/g, "");
 +            if (candidate.startsWith("/")) return candidate;
 +        }
 +    }
@@ -246,7 +263,9 @@ index 0000000..7af1f5a
 +            const fullSystemPrompt = systemPrompt ? `${systemPrompt}\n\n${ptDirective}` : ptDirective;
 +            const cwd = resolveWorkspaceCwd(fullSystemPrompt);
 +
-+            const dshSessionKey = options?.sessionId ? String(options.sessionId) : null;
++            // Separate title generation or ephemeral requests from persistent chat sessions
++            const isTitleRequest = Boolean(fullSystemPrompt && /title|concise title/i.test(fullSystemPrompt));
++            const dshSessionKey = (options?.sessionId && !isTitleRequest) ? String(options.sessionId) : null;
 +            let acpSessionId = dshSessionKey ? globalDaemon.acpSessionMap.get(dshSessionKey) : null;
 +            let isNewSession = false;
 +
@@ -265,9 +284,10 @@ index 0000000..7af1f5a
 +
 +            await globalDaemon.request("session/set_model", { sessionId: acpSessionId, modelId: model.id });
 +
-+            let prompt = isNewSession
++            let rawPrompt = isNewSession
 +                ? buildPrompt(normalizedContext.messages)
 +                : lastUserPrompt(normalizedContext.messages);
++            let prompt = ensureNonEmptyPrompt(rawPrompt);
 +
 +            let currentBlock = null;
 +            const blocks = output.content;
@@ -334,8 +354,8 @@ index 0000000..7af1f5a
 +            try {
 +                response = await globalDaemon.request("session/prompt", { sessionId: acpSessionId, prompt });
 +            } catch (err) {
-+                if (dshSessionKey && !isNewSession && /session/i.test(err.message)) {
-+                    // Session was lost or invalidated; recreate and replay with full prompt
++                if (dshSessionKey && !isNewSession && /session|non-empty/i.test(err.message)) {
++                    // Session was lost or invalid; recreate and replay with full prompt
 +                    globalDaemon.acpSessionMap.delete(dshSessionKey);
 +                    const session = await globalDaemon.request("session/new", {
 +                        cwd,
@@ -346,7 +366,7 @@ index 0000000..7af1f5a
 +                    globalDaemon.acpSessionMap.set(dshSessionKey, acpSessionId);
 +                    globalDaemon.sessionListeners.set(acpSessionId, onUpdate);
 +                    await globalDaemon.request("session/set_model", { sessionId: acpSessionId, modelId: model.id });
-+                    prompt = buildPrompt(normalizedContext.messages);
++                    prompt = ensureNonEmptyPrompt(buildPrompt(normalizedContext.messages));
 +                    response = await globalDaemon.request("session/prompt", { sessionId: acpSessionId, prompt });
 +                } else {
 +                    throw err;
