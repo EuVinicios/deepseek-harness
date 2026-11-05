@@ -12,6 +12,9 @@ import type { DesktopUpdateChannel } from '../../update-channel.ts'
 
 const execFileAsync = promisify(execFile)
 
+/** systemd --user unit that runs the updater with --force for app-initiated updates. */
+const MANUAL_UNIT = 'dsh-updater-manual.service'
+
 /** Discovers the dsh-updater script location across standard installation and repo paths. */
 export function findLinuxUpdaterScript(): string | undefined {
   if (process.env.DSH_UPDATER_SCRIPT && existsSync(process.env.DSH_UPDATER_SCRIPT)) {
@@ -25,7 +28,7 @@ export function findLinuxUpdaterScript(): string | undefined {
   for (const path of candidates) {
     if (existsSync(path)) return path
   }
-  const unitPath = join(homedir(), '.config/systemd/user/dsh-updater.service')
+  const unitPath = join(homedir(), '.config/systemd/user/dsh-updater-manual.service')
   if (existsSync(unitPath)) {
     try {
       const content = readFileSync(unitPath, 'utf8')
@@ -42,11 +45,11 @@ export function findLinuxUpdaterScript(): string | undefined {
   return undefined
 }
 
-/** Checks whether systemd user manager has the dsh-updater service available. */
-async function isSystemdServiceAvailable(): Promise<boolean> {
+/** Checks whether systemd user manager has the manual updater unit installed. */
+async function isSystemdManualUnitAvailable(): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync('systemctl', ['--user', 'list-unit-files', 'dsh-updater.service'], { timeout: 2000 })
-    return stdout.includes('dsh-updater.service')
+    const { stdout } = await execFileAsync('systemctl', ['--user', 'list-unit-files', MANUAL_UNIT], { timeout: 2000 })
+    return stdout.includes(MANUAL_UNIT)
   } catch {
     return false
   }
@@ -62,9 +65,23 @@ function makeUpdateEvent(version: string): UpdateDownloadedEvent {
     version,
     files: [],
     path: '',
+    // The updater builds and installs from trusted upstream sources; electron-updater's
+    // checksum step never runs on this local handoff.
     sha512: '',
     releaseDate: new Date().toISOString(),
     downloadedFile: '',
+  }
+}
+
+/** Version recorded by the last successful updater installation, or undefined. */
+function readInstalledVersion(): string | undefined {
+  const installedVersionFile = join(homedir(), 'opt/deepseek-harness/installed-version')
+  if (!existsSync(installedVersionFile)) return undefined
+  try {
+    const version = readFileSync(installedVersionFile, 'utf8').trim()
+    return version === '' ? undefined : version
+  } catch {
+    return undefined
   }
 }
 
@@ -133,11 +150,11 @@ export class LinuxAppUpdater extends EventEmitter {
       throw new Error('desktop update: linux updater script not found')
     }
 
-    const useSystemd = await isSystemdServiceAvailable()
+    const useSystemd = await isSystemdManualUnitAvailable()
     const progressFile = join(this.stateDir, 'progress.json')
 
     if (useSystemd) {
-      await execFileAsync('systemctl', ['--user', 'start', 'dsh-updater.service'])
+      await execFileAsync('systemctl', ['--user', 'start', '--no-block', MANUAL_UNIT])
     } else {
       spawn('bash', [script, '--force'], {
         detached: true,
@@ -160,7 +177,7 @@ export class LinuxAppUpdater extends EventEmitter {
         if (cancellationToken?.cancelled) {
           cleanup()
           if (useSystemd) {
-            void execFileAsync('systemctl', ['--user', 'stop', 'dsh-updater.service']).catch(() => {})
+            void execFileAsync('systemctl', ['--user', 'stop', MANUAL_UNIT]).catch(() => {})
           }
           reject(new Error('desktop update: download cancelled'))
           return
@@ -190,7 +207,7 @@ export class LinuxAppUpdater extends EventEmitter {
             const { stdout } = await execFileAsync('systemctl', [
               '--user',
               'show',
-              'dsh-updater.service',
+              MANUAL_UNIT,
               '--property=ActiveState,SubState,Result,ExecMainStatus',
             ])
             const props = Object.fromEntries(
@@ -203,10 +220,14 @@ export class LinuxAppUpdater extends EventEmitter {
             if (props.ActiveState === 'inactive' || props.ActiveState === 'failed') {
               cleanup()
               if (props.Result === 'success' && props.ExecMainStatus === '0') {
-                const installedVersionFile = join(homedir(), 'opt/deepseek-harness/installed-version')
-                const newVersion = existsSync(installedVersionFile)
-                  ? readFileSync(installedVersionFile, 'utf8').trim()
-                  : app.getVersion()
+                const newVersion = readInstalledVersion() ?? app.getVersion()
+                // A clean exit without a version change means the run was a no-op (for example,
+                // the hourly check held the lock); reporting it as a download would hand off
+                // a restart to the same version.
+                if (newVersion === app.getVersion()) {
+                  reject(new Error('desktop update: updater finished without installing a new version'))
+                  return
+                }
                 this.emit('download-progress', { percent: 100, total: 100, transferred: 100, bytesPerSecond: 0, delta: 0 })
                 this.emit('update-downloaded', makeUpdateEvent(newVersion))
                 resolve([newVersion])
@@ -223,10 +244,13 @@ export class LinuxAppUpdater extends EventEmitter {
           const lockFile = join(this.stateDir, 'lock')
           if (!existsSync(lockFile)) {
             cleanup()
-            const installedVersionFile = join(homedir(), 'opt/deepseek-harness/installed-version')
-            const newVersion = existsSync(installedVersionFile)
-              ? readFileSync(installedVersionFile, 'utf8').trim()
-              : app.getVersion()
+            const newVersion = readInstalledVersion() ?? app.getVersion()
+            // Same guard as the systemd path: a lock release without a version change was
+            // a no-op run, not a completed download.
+            if (newVersion === app.getVersion()) {
+              reject(new Error('desktop update: updater finished without installing a new version'))
+              return
+            }
             this.emit('download-progress', { percent: 100, total: 100, transferred: 100, bytesPerSecond: 0, delta: 0 })
             this.emit('update-downloaded', makeUpdateEvent(newVersion))
             resolve([newVersion])
