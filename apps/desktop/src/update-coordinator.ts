@@ -8,6 +8,7 @@ import { gt, valid } from 'semver'
 import type { DesktopUpdateState } from './ipc.ts'
 import { DesktopUpdateHttpExecutor } from './update-http-executor.ts'
 import { DesktopUpdatePreparationError } from './update-error.ts'
+import { createLinuxUpdater, isLinuxUpdateSupported } from './updates/linux/linux-updater.ts'
 
 const { autoUpdater } = electronUpdater
 
@@ -51,8 +52,10 @@ export class DesktopUpdateCoordinator {
   constructor(
     private readonly publish: (state: DesktopUpdateState) => DesktopUpdateState,
     private readonly beforeRestart: () => Promise<boolean>,
-    private readonly updater: AppUpdater = autoUpdater,
-    private readonly enabled: () => boolean = () => app.isPackaged && existsSync(join(process.resourcesPath, 'app-update.yml')),
+    private readonly updater: AppUpdater = process.platform === 'linux' ? createLinuxUpdater() : autoUpdater,
+    private readonly enabled: () => boolean = () => process.platform === 'linux'
+      ? isLinuxUpdateSupported()
+      : (app.isPackaged && existsSync(join(process.resourcesPath, 'app-update.yml'))),
     private readonly currentVersion: () => string = () => app.getVersion(),
     private readonly downloadResult?: (success: boolean, reason?: string) => void,
     private readonly channel: 'nightly' | 'latest' = 'nightly',
