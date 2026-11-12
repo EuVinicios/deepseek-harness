@@ -1,5 +1,9 @@
 #!/bin/sh
 # Run the installed CLI without changing the invoking shell or working directory.
+# The executable and the dsh tree live in platform-specific layouts: the macOS
+# bundle keeps Electron in Contents/MacOS and archives dsh inside app.asar, while
+# Linux ships the Electron binary beside resources/ and the dsh tree unpacked
+# (the Host runs the bundled Node, which cannot read an ASAR archive).
 set -e
 launcher=$0
 while [ -L "$launcher" ]; do
@@ -11,4 +15,18 @@ while [ -L "$launcher" ]; do
   esac
 done
 resources=$(CDPATH= cd -- "$(dirname -- "$launcher")/../../.." && pwd -P)
-ELECTRON_RUN_AS_NODE=1 exec "$resources/../MacOS/DeepSeek Harness" --expose-internals "$resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js" "$@"
+case "$(uname -s)" in
+  Darwin)
+    executable="$resources/../MacOS/DeepSeek Harness"
+    hostEntry="$resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js"
+    ;;
+  Linux)
+    executable="$resources/../deepseek-harness"
+    hostEntry="$resources/app/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js"
+    ;;
+  *)
+    echo "dsh: unsupported platform $(uname -s)" >&2
+    exit 1
+    ;;
+esac
+ELECTRON_RUN_AS_NODE=1 exec "$executable" --expose-internals "$hostEntry" "$@"
