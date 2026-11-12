@@ -270,6 +270,10 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
     minWidth: 520,
     minHeight: 600,
     show,
+    // Linux has no .desktop association when launched outside a menu entry; the
+    // window icon keeps the taskbar and alt-tab entries recognizable there.
+    ...(process.platform === 'linux' && app.isPackaged
+      ? { icon: join(process.resourcesPath, 'icon.png') } : {}),
     ...(process.platform === 'win32' && primary ? {
       titleBarStyle: 'hidden' as const,
       titleBarOverlay: { height: WINDOWS_TITLEBAR_HEIGHT, color: chromeFallbackFill(),
@@ -1065,7 +1069,7 @@ async function main(): Promise<void> {
       : { label: currentDesktopLocale().messages.aboutMenu, role: 'about' },
     { type: 'separator' },
     { label: currentDesktopLocale().messages.checkUpdatesMenu, click: () => { void openUpdatePrompt(true) } },
-    ...process.platform === 'darwin' || process.platform === 'win32'
+    ...process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux'
       ? [{ label: currentDesktopLocale().messages.cliCommandMenu, click: () => { void commandManager.show() } }] : [],
     { type: 'separator' },
     ...development ? [
@@ -1096,8 +1100,10 @@ async function main(): Promise<void> {
     tray?.relabel()
   }
   refreshApplicationMenu()
-  const trayIconPath = development ? join(app.getAppPath(), 'resources', 'tray-windows.ico') : join(process.resourcesPath, 'tray.ico')
-  if (process.platform === 'win32') {
+  // Windows packs a multi-size ICO; Linux tray hosts read PNG directly from the shipped app icon.
+  const trayIconPath = development ? join(app.getAppPath(), 'resources', 'tray-windows.ico')
+    : join(process.resourcesPath, process.platform === 'win32' ? 'tray.ico' : 'icon.png')
+  if (process.platform === 'win32' || process.platform === 'linux') {
     // The tray is the way back to a hidden window; without it, relaunching the application still focuses it.
     try {
       tray = new DesktopTray({ iconPath: trayIconPath, locale: currentDesktopLocale,

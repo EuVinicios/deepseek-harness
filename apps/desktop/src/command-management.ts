@@ -171,7 +171,7 @@ export class DesktopCommandManager {
 
   private async inspect(): Promise<CommandState> {
     const state = await this.worker('inspect')
-    if (process.platform !== 'darwin') return state
+    if (process.platform === 'win32') return state
     try {
       return { ...state, ...await shellCommand() }
     } catch {
