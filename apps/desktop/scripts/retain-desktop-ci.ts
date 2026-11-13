@@ -28,12 +28,25 @@ export function desktopReleasesRoot(env: NodeJS.ProcessEnv): string {
 }
 
 /**
+ * Resolve the retention-covered installer target, rejecting other platforms before routing work.
+ * @param env Machine identity carrying the resolved build target.
+ * @returns The narrowed mac or Windows target used by CI retention.
+ */
+function requireRetentionTarget(env: NodeJS.ProcessEnv): 'mac-arm64' | 'mac-x64' | 'win-x64' {
+  const target = resolveDesktopBuildTarget(env)
+  if (target !== 'mac-arm64' && target !== 'mac-x64' && target !== 'win-x64') {
+    throw new Error('desktop retention: CI retention covers mac and Windows targets only')
+  }
+  return target
+}
+
+/**
  * Resolve the original machine's unique label before expensive packaging work.
  * @param env Machine identity, target and administrator-owned runner mapping.
  * @returns The exact label used by the later GitHub archival job.
  */
 export function resolveDesktopRetentionRunner(env: NodeJS.ProcessEnv): string {
-  const target = resolveDesktopBuildTarget(env)
+  const target = requireRetentionTarget(env)
   const routes = desktopPublishRunnersSchema.parse(JSON.parse(required(env, 'DESKTOP_PUBLISH_RUNNERS')))
   const route = routes[required(env, 'RUNNER_NAME')]
   if (!route || !route.target.includes(target)
@@ -50,10 +63,7 @@ export function resolveDesktopRetentionRunner(env: NodeJS.ProcessEnv): string {
  * @returns Retained directory, including explicitly qualified debugging packages.
  */
 export async function retainDesktopCi(env: NodeJS.ProcessEnv, appRoot = resolve(import.meta.dirname, '..')): Promise<string> {
-  const target = resolveDesktopBuildTarget(env)
-  if (target !== 'mac-arm64' && target !== 'mac-x64' && target !== 'win-x64') {
-    throw new Error('desktop retention: CI retention covers mac and Windows targets only')
-  }
+  const target = requireRetentionTarget(env)
   const runnerLabel = resolveDesktopRetentionRunner(env)
   const windows = target === 'win-x64'
   const platform = windows ? 'win32' : 'darwin'
